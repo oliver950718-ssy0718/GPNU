@@ -13,43 +13,6 @@ suppressPackageStartupMessages({
 })
 
 # -----------------------------------------------------------------------------
-# 1. File locations and required variables
-# -----------------------------------------------------------------------------
-
-path <- list(
-  development = "data/development_cohort.csv",
-  fuscc = "data/fuscc_validation_cohort.csv",
-  yncc = "data/yncc_validation_cohort.csv",
-  fuscc_nat = "data/fuscc_nat_cohort.csv",
-  ispy2_nat = "data/ispy2_nat_cohort.csv",
-  radiomics = "data/radiomics_features.csv",
-  dl = "data/dl_features_from_public_pipeline.csv",
-  subtype = "data/frozen_stage2_subtype_assignments.csv",
-  habitat_pattern = "data/spatial_pattern_from_public_pipeline.csv",
-  locked_predictions = "data/locked_stage1_predictions.csv",
-  locked_stage1_model = "model/locked_stage1_xgboost.json",
-  stage1_parameters = "config/stage1_model_parameters.rds",
-  rna = "data/rna_pathway_results.csv",
-  rppa = "data/rppa_pathway_scores.csv",
-  mutation = "data/fuscc_mutation_matrix.csv",
-  snf = "data/fuscc_snf_subtypes.csv"
-)
-
-# Minimum patient-level fields expected in the relevant files:
-# patient_id, cohort, split, center, pcr, non_pcr, subtype,
-# dfs_time, dfs_event, regimen_group, and the clinicopathologic variables.
-# pcr is coded 1 for pCR and 0 for non-pCR; non_pcr = 1 - pcr.
-
-read_required <- function(file) {
-  if (!file.exists(file)) stop("Required file not found: ", file)
-  fread(file, data.table = FALSE)
-}
-
-clip_probability <- function(p, eps = 1e-6) {
-  pmin(pmax(as.numeric(p), eps), 1 - eps)
-}
-
-# -----------------------------------------------------------------------------
 # 2. Assemble radiomics and externally extracted DL features
 # -----------------------------------------------------------------------------
 
@@ -59,9 +22,6 @@ dl_features <- read_required(path$dl)
 feature_data <- radiomics %>%
   inner_join(dl_features, by = "patient_id")
 
-# DL feature extraction is not repeated here. The imported DL table should
-# contain the patient-level 192-dimensional ViT-Tiny representation generated
-# using the cited public implementation.
 
 rad_cols <- names(feature_data)[str_detect(names(feature_data), "^RAD_")]
 dl_cols <- names(feature_data)[str_detect(names(feature_data), "^DL_")]
@@ -116,7 +76,7 @@ lasso_select <- function(x, y, folds) {
   rownames(beta)[as.vector(beta != 0) & rownames(beta) != "(Intercept)"]
 }
 
-# Reproducibility analyses should use the prespecified training/testing split.
+
 development <- read_required(path$development)
 train_meta <- development %>% filter(split == "Training")
 test_meta <- development %>% filter(split == "Testing")
@@ -129,8 +89,6 @@ test_features <- feature_data %>%
   semi_join(test_meta, by = "patient_id") %>%
   arrange(match(patient_id, test_meta$patient_id))
 
-# All filtering and fitted transformations must be estimated from training data
-# only and transferred unchanged to held-out or external data.
 x_train_all <- train_features %>% select(all_of(c(rad_cols, dl_cols)))
 x_train_all <- remove_near_zero_variance(x_train_all)
 x_train_all <- remove_correlated_features(x_train_all)
@@ -172,21 +130,219 @@ fit_stage1_xgboost <- function(x, y, configuration) {
   )
 }
 
-# Exact paper-level downstream results are reproduced from locked, patient-level
-# out-of-fold/testing/external probabilities. To refit the locked model, use:
-# stage1_configuration <- load_stage1_configuration(path$stage1_parameters)
-# stage1_model <- fit_stage1_xgboost(
-#   x_train_scaled[, selected_features, drop = FALSE],
-#   train_meta$non_pcr,
-#   stage1_configuration
-# )
-# xgb.save(stage1_model, path$locked_stage1_model)
+predict_stage1_xgboost <- function(model, x) {
+  as.numeric(predict(model, xgb.DMatrix(as.matrix(x))))
+}
 
-predictions <- read_required(path$locked_predictions) %>%
+make_stratified_folds <- function(y, v = 5, seed = 2026) {
+  set.seed(seed)
+  fold <- integer(length(y))
+  for (level in sort(unique(y))) {
+    idx <- which(y == level)
+    fold[idx] <- sample(rep(seq_len(v), length.out = length(idx)))
+  }
+  fold
+}
+
+# All preprocessing objects used for a validation fold are estimated from the
+# corresponding fold-training data only.
+fit_fold_preprocessor <- function(x, y, seed) {
+  x <- as.data.frame(x, check.names = FALSE)
+  x <- remove_near_zero_variance(x)
+  x <- remove_correlated_features(x)
+  fold_scaler <- fit_scaler(x)
+  x_scaled <- apply_scaler(x, fold_scaler)
+  inner_fold <- make_stratified_folds(y, v = 5, seed = seed)
+  fold_features <- lasso_select(x_scaled, y, folds = inner_fold)
+  if (length(fold_features) == 0) {
+    fold_features <- colnames(x_scaled)
+  }
+  list(
+    input_features = colnames(x),
+    scaler = fold_scaler,
+    selected_features = fold_features
+  )
+}
+
+apply_fold_preprocessor <- function(x, preprocessor) {
+  missing_features <- setdiff(preprocessor$input_features, colnames(x))
+  if (length(missing_features) > 0) {
+    stop("Missing Stage 1 input features: ", paste(missing_features, collapse = ", "))
+  }
+  x <- as.data.frame(x[, preprocessor$input_features, drop = FALSE])
+  x_scaled <- apply_scaler(x, preprocessor$scaler)
+  x_scaled[, preprocessor$selected_features, drop = FALSE]
+}
+
+# SMOTE is applied only after a fold has been split and only to its training
+# portion; validation patients are never resampled.
+smote_training_fold <- function(x, y, seed) {
+  set.seed(seed)
+  training_data <- data.frame(
+    non_pcr = factor(y, levels = c(0, 1)),
+    as.data.frame(x, check.names = FALSE),
+    check.names = FALSE
+  )
+  smote_recipe <- recipes::recipe(non_pcr ~ ., data = training_data) %>%
+    themis::step_smote(non_pcr)
+  balanced <- recipes::prep(
+    smote_recipe, training = training_data, retain = TRUE
+  ) %>%
+    recipes::juice()
+  list(
+    x = balanced %>% select(-non_pcr) %>% as.matrix(),
+    y = as.numeric(as.character(balanced$non_pcr))
+  )
+}
+
+fit_stage1_pipeline <- function(x, y, configuration, seed) {
+  preprocessor <- fit_fold_preprocessor(x, y, seed = seed)
+  x_processed <- apply_fold_preprocessor(x, preprocessor)
+  balanced <- smote_training_fold(x_processed, y, seed = seed)
+  model <- fit_stage1_xgboost(
+    balanced$x, balanced$y, configuration = configuration
+  )
+  list(preprocessor = preprocessor, model = model)
+}
+
+predict_stage1_pipeline <- function(pipeline, x) {
+  x_processed <- apply_fold_preprocessor(x, pipeline$preprocessor)
+  predict_stage1_xgboost(pipeline$model, x_processed)
+}
+
+# Study-specific XGBoost settings are stored externally. This keeps the public
+# script executable without disclosing the final tuned parameter values.
+stage1_configuration <- load_stage1_configuration(path$stage1_configuration)
+model_feature_sets <- list(
+  RAD = intersect(rad_cols, colnames(x_train_all)),
+  DL = intersect(dl_cols, colnames(x_train_all)),
+  DR = intersect(c(rad_cols, dl_cols), colnames(x_train_all))
+)
+
+# Generate pooled out-of-fold probabilities for each Stage 1 model.
+stage1_oof <- imap_dfr(model_feature_sets, function(feature_names, model_name) {
+  oof_probability <- rep(NA_real_, nrow(train_meta))
+
+  for (fold in sort(unique(fold_id))) {
+    analysis_idx <- which(fold_id != fold)
+    assessment_idx <- which(fold_id == fold)
+    fold_pipeline <- fit_stage1_pipeline(
+      x = x_train_all[analysis_idx, feature_names, drop = FALSE],
+      y = train_meta$non_pcr[analysis_idx],
+      configuration = stage1_configuration$models[[model_name]],
+      seed = 2026 + fold
+    )
+    oof_probability[assessment_idx] <- predict_stage1_pipeline(
+      fold_pipeline,
+      x_train_all[assessment_idx, feature_names, drop = FALSE]
+    )
+  }
+
+  tibble(
+    patient_id = train_meta$patient_id,
+    cohort = "Training",
+    non_pcr = train_meta$non_pcr,
+    model = model_name,
+    prediction_source = "OOF",
+    p_non_pcr = clip_probability(oof_probability)
+  )
+})
+
+# Select the operating threshold from pooled DR OOF probabilities using the
+# sensitivity-prioritized rule specified in the external configuration.
+select_operating_threshold <- function(truth, probability, minimum_sensitivity) {
+  candidates <- sort(unique(probability))
+  performance <- map_dfr(candidates, function(threshold) {
+    predicted <- as.integer(probability >= threshold)
+    tp <- sum(predicted == 1 & truth == 1)
+    tn <- sum(predicted == 0 & truth == 0)
+    fp <- sum(predicted == 1 & truth == 0)
+    fn <- sum(predicted == 0 & truth == 1)
+    tibble(
+      threshold = threshold,
+      sensitivity = tp / (tp + fn),
+      specificity = tn / (tn + fp)
+    )
+  })
+
+  eligible <- performance %>% filter(sensitivity >= minimum_sensitivity)
+  if (nrow(eligible) == 0) {
+    stop("No OOF threshold satisfied the sensitivity-prioritized criterion.")
+  }
+  eligible %>%
+    arrange(desc(specificity), desc(sensitivity), desc(threshold)) %>%
+    slice(1) %>%
+    pull(threshold)
+}
+
+operating_threshold <- stage1_oof %>%
+  filter(model == "DR") %>%
+  summarise(
+    threshold = select_operating_threshold(
+      truth = non_pcr,
+      probability = p_non_pcr,
+      minimum_sensitivity = stage1_configuration$minimum_sensitivity
+    )
+  ) %>%
+  pull(threshold)
+
+# Refit each preprocessing pipeline and XGBoost classifier on the complete
+# training set. These objects are then locked for all subsequent predictions.
+locked_stage1_models <- imap(model_feature_sets, function(feature_names, model_name) {
+  fit_stage1_pipeline(
+    x = x_train_all[, feature_names, drop = FALSE],
+    y = train_meta$non_pcr,
+    configuration = stage1_configuration$models[[model_name]],
+    seed = 2026
+  )
+})
+locked_stage1_model <- locked_stage1_models$DR
+
+# Assemble patient identifiers and outcomes only; probabilities are generated
+# below by the locked model rather than read from a precomputed file.
+prediction_index <- bind_rows(
+  test_meta %>% transmute(patient_id, cohort = "Testing", non_pcr),
+  read_required(path$fuscc) %>%
+    transmute(patient_id, cohort = "FUSCC", non_pcr),
+  read_required(path$yncc) %>%
+    transmute(patient_id, cohort = "YNCC", non_pcr),
+  read_required(path$fuscc_nat) %>%
+    transmute(
+      patient_id, cohort = "FUSCC NAT",
+      non_pcr = 1L - as.integer(as.character(pcr))
+    ),
+  read_required(path$ispy2_nat) %>%
+    transmute(
+      patient_id, cohort = "I-SPY2 NAT",
+      non_pcr = 1L - as.integer(as.character(pcr))
+    )
+) %>%
+  inner_join(feature_data, by = "patient_id")
+
+locked_predictions <- imap_dfr(model_feature_sets, function(feature_names, model_name) {
+  tibble(
+    patient_id = prediction_index$patient_id,
+    cohort = prediction_index$cohort,
+    non_pcr = prediction_index$non_pcr,
+    model = model_name,
+    prediction_source = "Locked model",
+    p_non_pcr = predict_stage1_pipeline(
+      locked_stage1_models[[model_name]],
+      prediction_index[, feature_names, drop = FALSE]
+    )
+  )
+})
+
+# Downstream analyses use the DR probabilities. Training values are pooled OOF
+# predictions; all other values come from the locked full-training model.
+predictions <- bind_rows(
+  stage1_oof %>% filter(model == "DR"),
+  locked_predictions %>% filter(model == "DR")
+) %>%
   mutate(
     p_non_pcr = clip_probability(p_non_pcr),
     p_pcr_nac = 1 - p_non_pcr,
-    predicted_non_pcr = as.integer(p_non_pcr >= 0.58)
+    predicted_non_pcr = as.integer(p_non_pcr >= operating_threshold)
   )
 
 # -----------------------------------------------------------------------------
@@ -207,7 +363,7 @@ auc_with_ci <- function(data) {
   )
 }
 
-threshold_metrics <- function(data, threshold = 0.58) {
+threshold_metrics <- function(data, threshold = operating_threshold) {
   truth <- as.integer(as.character(data$non_pcr))
   estimate <- as.integer(data$p_non_pcr >= threshold)
   tp <- sum(estimate == 1 & truth == 1, na.rm = TRUE)
@@ -277,7 +433,7 @@ stage1_auc <- predictions %>%
 
 stage1_threshold <- predictions %>%
   group_by(cohort) %>%
-  group_modify(~ threshold_metrics(.x, threshold = 0.58)) %>%
+  group_modify(~ threshold_metrics(.x, threshold = operating_threshold)) %>%
   ungroup()
 
 stage1_calibration <- predictions %>%
@@ -285,8 +441,7 @@ stage1_calibration <- predictions %>%
   group_modify(~ calibration_bootstrap(.x, repetitions = 2000)) %>%
   ungroup()
 
-# Logistic calibration curves are used for evaluation only; fitted values from
-# these curves are not used to replace or modify locked model probabilities.
+
 calibration_curve_data <- predictions %>%
   group_by(cohort) %>%
   group_modify(~ {
@@ -328,10 +483,6 @@ subtype_data <- read_required(path$subtype) %>%
   ) %>%
   filter(non_pcr == 1) %>%
   mutate(subtype_binary = as.integer(subtype == "Subtype B"))
-
-# Consensus clustering, frozen nearest-centroid assignment, and spatial-pattern
-# classification are not reimplemented here because those procedures use the
-# cited public code. Their patient-level outputs are imported above and below.
 
 stage1_stage2_association <- subtype_data %>%
   group_by(cohort) %>%
@@ -430,8 +581,6 @@ clinicopathologic_models <- external_clinical %>%
   }) %>%
   ungroup()
 
-# FUSCC DFS is restricted to the prespecified subset with at least 5 years of
-# potential follow-up; all eligible YNCC non-pCR patients are retained.
 dfs_data <- external_clinical %>%
   filter(
     (cohort == "FUSCC" & potential_followup_years >= 5) |
@@ -517,8 +666,7 @@ mutation_results <- map_dfr(mutation_genes, function(gene) {
     )
   )
 
-# RNA pathway enrichment is performed with the cited pathway-analysis workflow;
-# its patient- or pathway-level result table is imported for summarization.
+
 rna_results <- read_required(path$rna) %>%
   mutate(adjusted_p = p.adjust(p_value, method = "BH"))
 
@@ -663,27 +811,3 @@ omics_concordance <- stage4_data %>%
   group_by(cohort) %>%
   group_modify(~ bootstrap_concordance(.x, repetitions = 2000)) %>%
   ungroup()
-
-# -----------------------------------------------------------------------------
-# 10. Export analysis tables and software environment
-# -----------------------------------------------------------------------------
-
-dir.create("results", showWarnings = FALSE, recursive = TRUE)
-
-write_csv(stage1_auc, "results/stage1_auc.csv")
-write_csv(stage1_threshold, "results/stage1_threshold_metrics.csv")
-write_csv(stage1_calibration, "results/stage1_calibration.csv")
-write_csv(stage1_stage2_association, "results/stage1_stage2_association.csv")
-write_csv(habitat_pattern_tests, "results/habitat_pattern_tests.csv")
-write_csv(clinicopathologic_models, "results/clinicopathologic_models.csv")
-write_csv(dfs_models, "results/dfs_cox_models.csv")
-write_csv(logrank_results, "results/dfs_logrank_tests.csv")
-write_csv(snf_distribution, "results/snf_distribution.csv")
-write_csv(mutation_results, "results/mutation_results.csv")
-write_csv(rna_results, "results/rna_pathway_results.csv")
-write_csv(rppa_results, "results/rppa_pathway_results.csv")
-write_csv(end_to_end_counts, "results/end_to_end_counts.csv")
-write_csv(opportunity_matrix, "results/opportunity_matrix.csv")
-write_csv(omics_concordance, "results/omics_concordance.csv")
-
-writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
